@@ -1,5 +1,17 @@
 Johnathon's file
 
+Get the data run this before so that you can load in the data to the environment
+
+```{r}
+
+library(readxl)
+X06_CAS_Predictive_Modeling_Case_Competition_Dataset <- read_excel("CAS-CaseComp/06 - CAS Predictive Modeling Case Competition- Dataset.xlsx")
+View(X06_CAS_Predictive_Modeling_Case_Competition_Dataset)
+
+```
+
+Start and create the data
+
 ```{r}
 set.seed(1)
 
@@ -20,6 +32,10 @@ valid <- df[-idx, ]
 names(train)
 ```
 
+1.  First model for generalized linear model
+
+Format is glm(parameters=what to use, dataset, family=type of distribution to use)
+
 ```{r}
 fit_freq <- glm(
   claims ~ (class + study + gpa + sprinklered + greek + off_campus + distance_to_campus + amount + risk_tier + coverage),
@@ -37,10 +53,6 @@ dispersion
 
 ```
 
-
-
-
-
 ```{r}
 library(MASS)
 
@@ -50,8 +62,3 @@ fit_freq_nb <- glm.nb(
 )
 summary(fit_freq_nb)
 ```
-
-
-
-
-

@@ -1,0 +1,57 @@
+Johnathon's file
+
+```{r}
+set.seed(1)
+
+df <- X06_CAS_Predictive_Modeling_Case_Competition_Dataset  # or readr::read_csv
+
+# Basic hygiene
+
+#df <- within(df, {
+#  exposure <- pmax(exposure, 1e-8)
+#})
+
+# Train/valid split
+idx <- sample(seq_len(nrow(df)), size = floor(0.8 * nrow(df)))
+train <- df[idx, ]
+valid <- df[-idx, ]
+
+
+names(train)
+```
+
+```{r}
+fit_freq <- glm(
+  claims ~ (class + study + gpa + sprinklered + greek + off_campus + distance_to_campus + amount + risk_tier + coverage),
+  
+  data = train,
+  family = poisson(link = "log"),
+  offset = log(exposure)
+)
+
+summary(fit_freq)
+
+# Overdispersion check (rule-of-thumb)
+dispersion <- sum(residuals(fit_freq, type="pearson")^2) / fit_freq$df.residual
+dispersion
+
+```
+
+
+
+
+
+```{r}
+library(MASS)
+
+fit_freq_nb <- glm.nb(
+  n_claims ~ year + dorm_location + distance + sprinkler + greek + ... + offset(log(exposure)),
+  data = train
+)
+summary(fit_freq_nb)
+```
+
+
+
+
+

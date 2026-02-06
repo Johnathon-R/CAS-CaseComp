@@ -12,3 +12,4 @@ Questions to be Answered:
 
 First goal: 
 Look for patterns in data
+

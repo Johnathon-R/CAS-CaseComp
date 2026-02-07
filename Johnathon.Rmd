@@ -26,7 +26,9 @@ Q4. What is the exposure period (1 Year, whole school year, monthly?)\
 Q5. Do we want to price: Total premium per student or separate for each coverage then sum?
 
 ## Setting up the environment
+
 Make sure to install imports before running code!
+
 ```{r imports}
 library(readxl)
 library(ggplot2)
@@ -49,7 +51,7 @@ Answers:\
 Diagnostic shows that there are multiple claims for a single student so some studentxcoverage pairs appear more than once (duplicates or repeats). To use a GLM we need only one row per observation.
 
 Thus we will have one row per `student_id` and per `coverage`, summing the loss for multiple claims of the same coverage in `model_cov`.\
-We carry the aggregate loss in variable `loss`, and `claim_count` to show the number of collapsed rows. `has_claim` is 0 or 1 representing yes or not to having a claim.  We also create `model_student` which summarises per student irrespective of coverage, so there is only one row per student.
+We carry the aggregate loss in variable `loss`, and `claim_count` to show the number of collapsed rows. `has_claim` is 0 or 1 representing yes or not to having a claim. We also create `model_student` which summarises per student irrespective of coverage, so there is only one row per student.
 
 ```{r setup}
 # Read the excel spreadsheet
@@ -108,7 +110,6 @@ model_cov %>% count(student_id, coverage) %>% summarise(max_n = max(n))
 model_cov %>% count(student_id) %>% summarise(min_rows = min(n), max_rows = max(n))
 ```
 
-
 Here we are splitting the 80th percentile data so that we can have a set to train the model, then a set to validate whether the model is accurate.Variables `train`, and `valid` respectively.
 
 ```{r}
@@ -149,12 +150,10 @@ Where $\theta_i$ is a parameter related to the mean, and $\phi$ is a scale param
 Generally, GLM's in insurance policy use Tweedie (single model): handles 0 loss and positive loss. Alternatively Two Part model: handles frequency (claim indicator + count) and the severity of the loss
 
 We will implement both to see which is more accurate. First implementing a Tweedie log link.\
-- Include risk_tier as a factor => different baseline per risk_tier
-- Include coverage as a factor => different baseline per coverage
-- Allow predictors to vary by coverage
-- Fit on training so holdout==FALSE
+- Include risk_tier as a factor =\> different baseline per risk_tier - Include coverage as a factor =\> different baseline per coverage - Allow predictors to vary by coverage - Fit on training so holdout==FALSE
 
 Format the data for model.
+
 ```{r}
 # 1) Prep variables (do this once)
 model_cov2 <- model_cov %>%
@@ -168,35 +167,28 @@ model_cov2 <- model_cov %>%
     study     = factor(study),
     sprinklered = factor(sprinklered),
     log_dist = log1p(distance_to_campus),
-    gpa_c = gpa - mean(gpa, na.rm = TRUE)
   )
 
 train <- model_cov2 %>% filter(!holdout)
 test  <- model_cov2 %>% filter(holdout)
 ```
 
-
 Actually train the model. This make take some time.
 
 The model works by repeatedly fitting a Tweedie GLM for every given p value in our p-vector then comparing the log-likelihoods to choose the best p.
 
-*ISSUE WHEN FIRST RUNNING MODEL\
+\*ISSUE WHEN FIRST RUNNING MODEL\
 The p values were too high, we were using 1.1 to 1.9 however values after 1.544898 were unstable.\
-Divergence at higher p is likely because:
-- Very heavy tailed losses (distribution is extremely skewed)
-- Many exact 0s mixed with large positives
-- Higher-dimensional factor (matrix associated can be too large and values become skewed)
-- Rare categories (Certain combinations of factors produce almost 0s)
-
+Divergence at higher p is likely because: - Very heavy tailed losses (distribution is extremely skewed) - Many exact 0s mixed with large positives - Higher-dimensional factor (matrix associated can be too large and values become skewed) - Rare categories (Certain combinations of factors produce almost 0s)
 
 ```{r}
 # 2) Estimate Tweedie variance power p (data-driven)
 p_fit <- tweedie.profile(
   loss ~ risk_tier + coverage +
-    coverage:(off_campus + distance_to_campus + sprinklered) +
-    gender + greek + gpa_c + class + study,
+    coverage:(off_campus + log_dist + sprinklered) +
+    gender + greek + gpa + class + study,
   data = train,
-  p.vec = seq(1.1, 1.545, by = 0.05)
+  p.vec = seq(1.1, 1.55, by = 0.05)
 )
 p_hat <- p_fit$p.max
 
@@ -204,7 +196,7 @@ p_hat <- p_fit$p.max
 tw_fit <- glm(
   loss ~ risk_tier + coverage +
     coverage:(off_campus + log_dist + sprinklered) +
-    gender + greek + gpa_c + class + study,
+    gender + greek + gpa + class + study,
   data = train,
   family = tweedie(var.power = p_hat, link.power = 0)
 )
@@ -213,10 +205,49 @@ tw_fit <- glm(
 model_cov2$pure_cov <- predict(tw_fit, newdata = model_cov2, type = "response")
 ```
 
-What this gives is `pure_cov` = E[`loss` | `covariates`] as our model
+What this gives is `pure_cov` = E[`loss` \| `covariates`] as our model
 
+Checking now the calibration of our model.
 
+```{r}
+hold <- model_cov2 %>% filter(holdout)
 
+c(
+  actual_mean = mean(hold$loss),
+  pred_mean   = mean(hold$pure_cov)
+)
 
+hold %>%
+  mutate(decile = dplyr::ntile(pure_cov, 10)) %>%
+  group_by(decile) %>%
+  summarise(actual = mean(loss), pred = mean(pure_cov), n = n(), .groups="drop")
+```
 
+The results are as follows, an actual mean vs predicted mean are 4% off gotten by $|216.6096 - 208.2771|/208.2771 \approx 0.04$. The decile divides our model into 10 subgroups of 10% depending on risk. Notice that as the deciles go up, the actual mean and predicted mean also increase except for two small scenarios which are marginally off. The highest decile shows a large increase which is exactly what we want. However, notice that our model is slightly more aggressive when differentiating between high risk and low risk. This creates potential equity/acceptance issues.
 
+To implement a fix for few premiums dominating the outcomes we will quantile the data.
+
+```{r}
+cap_tbl <- model_cov2 %>%
+  filter(!holdout) %>%
+  group_by(coverage) %>%
+  summarise(cap = quantile(pure_cov, 0.995), .groups="drop")
+
+model_cov2 <- model_cov2 %>%
+  left_join(cap_tbl, by="coverage") %>%
+  mutate(pure_cov_cap = pmin(pure_cov, cap))
+```
+
+Construct the pricing per tiers by using base tiers as per the information.
+
+```{r}
+base_by_tier_cov <- model_cov2 %>%
+  filter(!holdout) %>%
+  group_by(risk_tier, coverage) %>%
+  summarise(base_pure_cov = mean(pure_cov), .groups = "drop")
+
+priced_cov <- model_cov2 %>%
+  left_join(base_by_tier_cov, by = c("risk_tier", "coverage")) %>%
+  mutate(relativity_cov = pure_cov / base_pure_cov)
+
+```

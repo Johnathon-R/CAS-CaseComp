@@ -1,0 +1,45 @@
+```{r}
+
+library(readxl)
+X06_CAS_Predictive_Modeling_Case_Competition_Dataset <- read_excel("06 - CAS Predictive Modeling Case Competition- Dataset.xlsx")
+View(X06_CAS_Predictive_Modeling_Case_Competition_Dataset)
+```
+
+
+```{r}
+set.seed(1)
+
+df <- X06_CAS_Predictive_Modeling_Case_Competition_Dataset  # or readr::read_csv
+
+# Basic hygiene
+
+#df <- within(df, {
+#  exposure <- pmax(exposure, 1e-8)
+#})
+
+# Train/valid split
+idx <- sample(seq_len(nrow(df)), size = floor(0.8 * nrow(df)))
+train <- df[idx, ]
+valid <- df[-idx, ]
+
+names(train)
+```
+
+```{r}
+table(df$coverage)
+```
+```{r}
+# Load ggplot2 if not already
+library(ggplot2)
+
+# Boxplot of amount by Greek status
+ggplot(df, aes(x = greek, y = amount)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(
+    title = "Insurance Amount by Greek Life Status",
+    x = "Greek Life",
+    y = "Insurance Amount"
+  ) +
+  theme_minimal()
+```
+

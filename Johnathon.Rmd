@@ -110,17 +110,17 @@ model_cov %>% count(student_id, coverage) %>% summarise(max_n = max(n))
 model_cov %>% count(student_id) %>% summarise(min_rows = min(n), max_rows = max(n))
 ```
 
-Here we are splitting the 80th percentile data so that we can have a set to train the model, then a set to validate whether the model is accurate.Variables `train`, and `valid` respectively.
+Here we are splitting the 99th percentile data so that we can have a set to train the model, then a set to validate whether the model is accurate.Variables `train`, and `valid` respectively.
 
 ```{r}
-# Train/valid splitting index
-idx <- sample(seq_len(nrow(model_cov)), size = floor(0.8 * nrow(model_cov)))
+# 99th percentile threshold
+thr99 <- quantile(df$amount, 0.995, na.rm = TRUE)
 
-# Data used to train the model
-train <- model_cov[idx, ]
-
-# Data used to validate the model
-valid <- model_cov[-idx, ]
+# Students in the top 1%
+top1_ids <- df %>% 
+  filter(amount > thr99) %>%
+  distinct(student_id) %>%
+  pull(student_id)
 ```
 
 ### Implementing a Generalized Linear Model
@@ -157,6 +157,7 @@ Format the data for model.
 ```{r}
 # 1) Prep variables (do this once)
 model_cov2 <- model_cov %>%
+  filter(!(student_id %in% top1_ids)) %>%
   mutate(
     risk_tier = factor(risk_tier),
     coverage  = factor(coverage),
@@ -186,17 +187,19 @@ Divergence at higher p is likely because: - Very heavy tailed losses (distributi
 p_fit <- tweedie.profile(
   loss ~ risk_tier + coverage +
     coverage:(off_campus + log_dist + sprinklered) +
-    gender + greek + gpa + class + study,
+    gender + greek + class + study,
   data = train,
   p.vec = seq(1.1, 1.55, by = 0.05)
 )
 p_hat <- p_fit$p.max
+```
 
+```{r}
 # 3) Fit Tweedie GLM (log link)
 tw_fit <- glm(
   loss ~ risk_tier + coverage +
     coverage:(off_campus + log_dist + sprinklered) +
-    gender + greek + gpa + class + study,
+    gender + greek + class + study,
   data = train,
   family = tweedie(var.power = p_hat, link.power = 0)
 )
@@ -210,6 +213,7 @@ What this gives is `pure_cov` = E[`loss` \| `covariates`] as our model
 Checking now the calibration of our model.
 
 ```{r}
+
 hold <- model_cov2 %>% filter(holdout)
 
 c(
@@ -225,9 +229,12 @@ hold %>%
 
 The results are as follows, an actual mean vs predicted mean are 4% off gotten by $|216.6096 - 208.2771|/208.2771 \approx 0.04$. The decile divides our model into 10 subgroups of 10% depending on risk. Notice that as the deciles go up, the actual mean and predicted mean also increase except for two small scenarios which are marginally off. The highest decile shows a large increase which is exactly what we want. However, notice that our model is slightly more aggressive when differentiating between high risk and low risk. This creates potential equity/acceptance issues.
 
-To implement a fix for few premiums dominating the outcomes we will quantile the data.
+We tried the 99th percentile but this caused our error to increase to 7% and we were essentially excluding claimed amounts values greater than 9000.\
+We then tried the 99.5th percentile and got a better error of 2.7% but this time we were undercharging and exclude loss for greater than 20,000. However it is important to note that the 4th decile is always decreasing significantly from the previous value. So in this case it went from 64 to 28 for actual.
 
+Find the cap and cap for that given model.
 ```{r}
+# The 99.5th quantile of prices to "Cap" rates at this value.
 cap_tbl <- model_cov2 %>%
   filter(!holdout) %>%
   group_by(coverage) %>%
@@ -238,16 +245,100 @@ model_cov2 <- model_cov2 %>%
   mutate(pure_cov_cap = pmin(pure_cov, cap))
 ```
 
+`pure_cov` is the models expected loss for that student and that coverage per unit exposure. So `pure_cov` = $E[loss_i | X_i]$\
+`cap` is the upper limit for that coverage category\
+`pure_cov_cap` is the minimum value between cap and pure_cov\
+`base_pure_cov` is the base rate for the average policy holder\
+`relativity_cov` is the multiplicative factor that compares a person to a tier.\
+
+### Constructing the Priceing
+
 Construct the pricing per tiers by using base tiers as per the information.
 
+Below we calculate the tier x coverage rate on only the training data.
 ```{r}
+# Base tier rate per coverage
 base_by_tier_cov <- model_cov2 %>%
   filter(!holdout) %>%
   group_by(risk_tier, coverage) %>%
   summarise(base_pure_cov = mean(pure_cov), .groups = "drop")
 
+model_cov2 <- model_cov2 %>%
+  left_join(base_by_tier_cov, by=c("risk_tier","coverage")) %>%
+  mutate(relativity_cov = pure_cov_cap / base_pure_cov)
+```
+
+### Charging the Premium now
+
+Fix values for us to charge the premium.
+```{r}
+fixed_expense <- 25      # per policy (not per coverage)
+var_exp_ratio <- 0.20    # variable expense ratio
+profit_ratio  <- 0.05    # underwriting profit / contingency ratio
+cap_q <- 0.995           # prediction cap percentile within coverage
+use_cap <- TRUE          # set FALSE to skip capping
+
+```
+
+`pure_total` is each students expected loss.\
+`base_pure_total` is the tier based pure premium for the average insured in that tier.
+
+Build policy-level totals first
+```{r}
+policy_tbl <- model_cov2 %>%
+  group_by(student_id, risk_tier, holdout) %>%
+  summarise(
+    pure_total = sum(pure_cov, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    premium_total = (pure_total + fixed_expense) / (1 - var_exp_ratio - profit_ratio)
+  )
+```
+
+Allocate policy premiums back to coverages proportionally
+```{r}
+
 priced_cov <- model_cov2 %>%
-  left_join(base_by_tier_cov, by = c("risk_tier", "coverage")) %>%
-  mutate(relativity_cov = pure_cov / base_pure_cov)
+  left_join(policy_tbl, by = c("student_id", "risk_tier", "holdout")) %>%
+  group_by(student_id) %>%
+  mutate(
+    # allocation weight: share of pure premium
+    w = ifelse(pure_total > 0, pure_cov_cap / pure_total, 1/4),
+    premium_cov = premium_total * w
+  ) %>%
+  ungroup()
+```
+
+`premium_total`: the final premium charged per student
+`premium_cov`: charged premium per coverage that sums to premium_total per student
+
+### Produce the final deliverables
+
+```{r}
+final_policy_prices <- policy_tbl %>%
+  arrange(risk_tier, student_id)
+
+final_coverage_prices <- priced_cov %>%
+  select(
+    student_id, risk_tier, coverage, holdout,
+    base_pure_cov, relativity_cov,
+    pure_cov_cap, premium_cov
+  ) %>%
+  arrange(student_id, coverage)
+
+final_coverage_prices
+
+final_policy_prices
+```
+
+```{r}
+check_sum <- final_coverage_prices %>%
+  group_by(student_id) %>%
+  summarise(sum_cov = sum(premium_cov), .groups = "drop") %>%
+  left_join(final_policy_prices, by = "student_id") %>%
+  summarise(max_abs_diff = max(abs(sum_cov - premium_total)))
+
+check_sum
 
 ```

@@ -296,7 +296,7 @@ policy_tbl <- model_cov2 %>%
   )
 ```
 
-Allocate policy premiums back to coverages proportionally
+Allocate policy premiums back to coverage proportionally
 ```{r}
 
 priced_cov <- model_cov2 %>%
@@ -331,6 +331,10 @@ final_coverage_prices
 
 final_policy_prices
 ```
+
+# ISSUE BIG ISSUE
+
+This means that for one student, that the difference between what they should be getting charged and what they are is $1400 which is a huge difference not just some noise. We must fix this!!
 
 ```{r}
 check_sum <- final_coverage_prices %>%

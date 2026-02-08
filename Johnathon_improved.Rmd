@@ -1,0 +1,325 @@
+---
+title: "CAS Case Competition - Pricing Model (Improved Pipeline)"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readxl)
+library(tweedie)
+```
+
+## 1) Read data and build one row per student x coverage (KEEP the provided holdout)
+
+Key fix: **holdout is defined at the student×coverage row level** in the dataset. Do not convert it to a student-level flag using `any()` across the 4 coverages; that shrinks training data and makes Tier-2 Liability nearly unlearnable.
+
+```{r}
+df <- read_excel("06 - CAS Predictive Modeling Case Competition- Dataset.xlsx") %>%
+  mutate(
+    has_claim_row = (claim_id != 0) & (amount > 0)
+  )
+
+model_cov <- df %>%
+  group_by(student_id, coverage) %>%
+  summarise(
+    # static student fields
+    name = first(name),
+    class = first(class),
+    study = first(study),
+    gpa = first(gpa),
+    greek = first(greek),
+    off_campus = first(off_campus),
+    distance_to_campus = first(distance_to_campus),
+    gender = first(gender),
+    sprinklered = first(sprinklered),
+    risk_tier = first(risk_tier),
+
+    # IMPORTANT: holdout stays at student×coverage level (robust if duplicates)
+    holdout = any(holdout),
+
+    # targets
+    loss = sum(amount, na.rm = TRUE),
+    has_claim = as.integer(any(has_claim_row)),
+    n_claims = sum(has_claim_row),
+    n_raw_rows = n(),
+
+    .groups = "drop"
+  )
+```
+
+## 2) Feature prep + split
+
+```{r}
+model_cov2 <- model_cov %>%
+  mutate(
+    risk_tier = factor(risk_tier),
+    coverage  = factor(coverage),
+    gender    = factor(gender),
+    off_campus= factor(off_campus),
+    greek     = factor(greek),
+    class     = factor(class),
+    study     = factor(study),
+    sprinklered = factor(sprinklered),
+    log_dist  = log1p(distance_to_campus),
+    gpa_c     = gpa - mean(gpa, na.rm = TRUE)
+  )
+
+train <- model_cov2 %>% filter(!holdout)
+test  <- model_cov2 %>% filter(holdout)
+```
+
+## 3) Two-part model (frequency × severity) for expected loss
+
+This is the most reliable way to handle heavy zero-inflation (especially Liability / Guest Medical) without unstable interaction explosions.
+
+### 3a) Frequency (any claim)
+
+```{r}
+freq_fit <- glm(
+  has_claim ~ risk_tier * coverage +
+    coverage:(off_campus + log_dist + sprinklered) +
+    gender + greek + class + study + gpa_c,
+  data = train,
+  family = binomial()
+)
+```
+
+### 3b) Severity (positive loss only)
+
+```{r}
+sev_train <- train %>% filter(loss > 0)
+
+sev_fit <- glm(
+  loss ~ risk_tier * coverage +
+    coverage:(off_campus + log_dist + sprinklered) +
+    gender + greek + class + study + gpa_c,
+  data = sev_train,
+  family = Gamma(link = "log")
+)
+```
+
+### 3c) Expected loss prediction
+
+```{r}
+model_cov2 <- model_cov2 %>%
+  mutate(
+    p_claim = predict(freq_fit, newdata = model_cov2, type = "response"),
+    sev_mu  = predict(sev_fit,  newdata = model_cov2, type = "response"),
+    pure_cov = p_claim * sev_mu
+  )
+```
+
+## 4) Coverage-specific capping (premium control only)
+
+Do not remove observations from training to “underwrite.” If you want underwriting, add a flag and exclude those policies consistently in portfolio results.
+
+```{r}
+cap_tbl <- model_cov2 %>%
+  filter(!holdout) %>%
+  group_by(coverage) %>%
+  summarise(
+    cap = quantile(
+      pure_cov,
+      probs = dplyr::case_when(
+        dplyr::first(coverage) == "Liability" ~ 0.999,
+        dplyr::first(coverage) == "Guest Medical" ~ 0.999,
+        TRUE ~ 0.995
+      ),
+      na.rm = TRUE
+    ),
+    
+    .groups = "drop"
+  )
+
+# sanity check: should be exactly 1 row per coverage
+stopifnot(max(dplyr::count(cap_tbl, coverage)$n) == 1)
+
+model_cov2 <- model_cov2 %>%
+  left_join(cap_tbl, by = "coverage") %>%
+  mutate(pure_cov_cap = pmin(pure_cov, cap))
+
+```
+
+## 5) Tier×Coverage base-rate anchoring (fixes persistent tier bias)
+
+Your earlier approach used `mean(pure_cov_cap)` as the base, which cannot fix systematic tier-level underprediction.
+Instead, use the **actual** training mean loss as the base level, and use the model only for relativities.
+
+```{r}
+# training summaries for base + relativities
+train_scored <- model_cov2 %>% filter(!holdout)
+
+base_tbl <- train_scored %>%
+  group_by(risk_tier, coverage) %>%
+  summarise(
+    base_loss = mean(loss),
+    mean_pred = mean(pure_cov_cap),
+    .groups="drop"
+  ) %>%
+  mutate(
+    # scale factor so that (within train) the mean indicated equals mean actual for each tier×coverage
+    k = ifelse(mean_pred > 0, base_loss / mean_pred, 1)
+  )
+
+model_cov2 <- model_cov2 %>%
+  left_join(base_tbl %>% select(risk_tier, coverage, k), by = c("risk_tier","coverage")) %>%
+  mutate(pure_indicated = pure_cov_cap * k)
+```
+
+## 6) Diagnostics
+
+### Tier-level calibration (holdout rows)
+
+```{r}
+model_cov2 %>%
+  filter(holdout) %>%
+  group_by(risk_tier) %>%
+  summarise(
+    actual = mean(loss),
+    pred   = mean(pure_indicated),
+    pct_err = (pred - actual) / actual * 100,
+    n = n(),
+    .groups="drop"
+  )
+```
+
+### Tier×Coverage calibration (holdout rows)
+
+```{r}
+model_cov2 %>%
+  filter(holdout) %>%
+  group_by(risk_tier, coverage) %>%
+  summarise(
+    actual = mean(loss),
+    pred   = mean(pure_indicated),
+    pct_err = (pred - actual) / actual * 100,
+    n = n(),
+    .groups="drop"
+  )
+```
+
+## 7) Underwriting exclusions (optional, no data deletion)
+
+Example: decline policies where predicted Liability pure premium exceeds a threshold.
+Choose threshold on training (e.g., 99.5% within Liability), then apply consistently.
+
+```{r}
+liab_cut <- model_cov2 %>%
+  filter(!holdout, coverage == "Liability") %>%
+  summarise(cut = quantile(pure_indicated, 0.995, na.rm=TRUE)) %>%
+  pull(cut)
+
+uw_policy <- model_cov2 %>%
+  mutate(uw_flag = (coverage == "Liability") & (pure_indicated > liab_cut)) %>%
+  group_by(student_id) %>%
+  summarise(uw_exclude_policy = any(uw_flag), .groups="drop")
+
+# If declining the entire policy:
+model_cov2_accept <- model_cov2 %>%
+  left_join(uw_policy, by="student_id") %>%
+  filter(!uw_exclude_policy)
+
+# Re-check tier calibration on accepted policies only:
+model_cov2_accept %>%
+  filter(holdout) %>%
+  group_by(risk_tier) %>%
+  summarise(
+    actual = mean(loss),
+    pred   = mean(pure_indicated),
+    pct_err = (pred - actual) / actual * 100,
+    n = n(),
+    .groups="drop"
+  )
+```
+
+```{r}
+
+# ================================
+# MODEL PERFORMANCE CHECK (drop-in)
+# ================================
+
+# 0) Choose what you want to evaluate
+#    - actual_col: usually "loss"
+#    - pred_col:   set to the column you are actually using for pricing
+#                 e.g. "pure_cov", "pure_cov_cap", "pure_cov_cal", "pure_cov_tiercal"
+actual_col <- "loss"
+pred_col   <- "pure_cov_cap"   # <- CHANGE THIS
+
+# Optional: if you created an underwriting exclusion flag at policy level (TRUE/FALSE)
+# set this to the column name, else set to NULL
+uw_policy_flag <- NULL         # e.g. "uw_exclude_policy"
+
+# 1) Safety checks
+stopifnot(actual_col %in% names(model_cov2))
+stopifnot(pred_col   %in% names(model_cov2))
+if (!is.null(uw_policy_flag)) stopifnot(uw_policy_flag %in% names(model_cov2))
+
+# 2) Helper: error metrics
+err_metrics <- function(df, actual, pred) {
+  a <- df[[actual]]
+  p <- df[[pred]]
+  tibble(
+    n = nrow(df),
+    actual_mean = mean(a, na.rm = TRUE),
+    pred_mean   = mean(p, na.rm = TRUE),
+    bias        = mean(p - a, na.rm = TRUE),
+    pct_bias    = 100 * mean(p - a, na.rm = TRUE) / mean(a, na.rm = TRUE),
+    MAE         = mean(abs(p - a), na.rm = TRUE),
+    RMSE        = sqrt(mean((p - a)^2, na.rm = TRUE)),
+    MAPE_pct    = 100 * mean(abs((p - a) / pmax(a, 1)), na.rm = TRUE),
+    corr        = suppressWarnings(cor(a, p, use = "complete.obs"))
+  )
+}
+
+# 3) Select evaluation dataset (holdout)
+eval_df <- model_cov2 %>% filter(holdout)
+
+# Optional: remove underwritten policies from evaluation (policy-level flag replicated across rows)
+if (!is.null(uw_policy_flag)) {
+  eval_df <- eval_df %>% filter(!.data[[uw_policy_flag]])
+}
+
+cat("\n=== COVERAGE-ROW LEVEL: OVERALL (HOLDOUT) ===\n")
+print(err_metrics(eval_df, actual_col, pred_col))
+
+cat("\n=== COVERAGE-ROW LEVEL: BY RISK TIER (HOLDOUT) ===\n")
+print(eval_df %>% group_by(risk_tier) %>% group_modify(~err_metrics(.x, actual_col, pred_col)) %>% ungroup())
+
+cat("\n=== COVERAGE-ROW LEVEL: BY COVERAGE (HOLDOUT) ===\n")
+print(eval_df %>% group_by(coverage) %>% group_modify(~err_metrics(.x, actual_col, pred_col)) %>% ungroup())
+
+cat("\n=== COVERAGE-ROW LEVEL: BY TIER x COVERAGE (HOLDOUT) ===\n")
+print(eval_df %>% group_by(risk_tier, coverage) %>% group_modify(~err_metrics(.x, actual_col, pred_col)) %>% ungroup())
+
+# 4) Decile lift (holdout) for ranking check
+cat("\n=== DECILE LIFT (HOLDOUT, by prediction) ===\n")
+print(
+  eval_df %>%
+    mutate(decile = ntile(.data[[pred_col]], 10)) %>%
+    group_by(decile) %>%
+    summarise(
+      n = n(),
+      actual = mean(.data[[actual_col]], na.rm = TRUE),
+      pred   = mean(.data[[pred_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+)
+
+# 5) POLICY (STUDENT) LEVEL evaluation: sum the 4 coverages per student
+policy_eval <- eval_df %>%
+  group_by(student_id, risk_tier) %>%
+  summarise(
+    actual_total = sum(.data[[actual_col]], na.rm = TRUE),
+    pred_total   = sum(.data[[pred_col]], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\n=== POLICY LEVEL: OVERALL (HOLDOUT) ===\n")
+print(err_metrics(policy_eval, "actual_total", "pred_total"))
+
+cat("\n=== POLICY LEVEL: BY RISK TIER (HOLDOUT) ===\n")
+print(policy_eval %>% group_by(risk_tier) %>% group_modify(~err_metrics(.x, "actual_total", "pred_total")) %>% ungroup())
+
+
+
+```

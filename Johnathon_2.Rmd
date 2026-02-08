@@ -1,0 +1,368 @@
+# CAS Case Comp
+
+## Overview
+
+Our goal is to create a pricing model for ABG Insurance's dormitory insurance plan to optimizing the premiums they charge. The following must hold for the insurance coverage:
+
+1.  Personal Property Protection
+    -   Cover Valuables (Furniture, electronics, clothing,...)
+    -   up to \$10,000 - base policy.
+2.  Additional Living expenses
+    -   Help pay for increased living costs if the dorm is uninhabitable.
+3.  Liability Protection
+    -   Someone sues for injury on property
+    -   limited to \$500,000.
+4.  Guest Medical Protection
+    -   Someone incurs a medical expense from an injury on the property.
+    -   Limited to \$150,000
+
+For any policy holder, the above 4 must be provided. Each coverage tier will have their own rating algorithm, with base rate charged for the "average" policy holder within that tier. There are already 3 tiers provided- Preferred, Standard, and Non-Standard.
+
+Key questions/assumptions:\
+Q1. What pricing model are we going to use?\
+Q2. What data cleaning procedures?\
+Q3. Is the amount the total loss or just for that claim?\
+Q4. What is the exposure period (1 Year, whole school year, monthly?)\
+Q5. Do we want to price: Total premium per student or separate for each coverage then sum?
+
+## Setting up the environment
+
+Make sure to install imports before running code!
+
+```{r imports}
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(tweedie)
+library(statmod)
+
+set.seed(1)
+```
+
+### Cleaning the data process
+
+First we have to check the dataset to perform the correct cleaning procedures.
+
+Q1: Is there more than one row per student×coverage?\
+Q2: Do non-claims still have rows?\
+Q3: Are amounts present on non-claim rows?\
+
+Answers:\
+Diagnostic shows that there are multiple claims for a single student so some studentxcoverage pairs appear more than once (duplicates or repeats). To use a GLM we need only one row per observation.
+
+Thus we will have one row per `student_id` and per `coverage`, summing the loss for multiple claims of the same coverage in `model_cov`.\
+We carry the aggregate loss in variable `loss`, and `claim_count` to show the number of collapsed rows. `has_claim` is 0 or 1 representing yes or not to having a claim. We also create `model_student` which summarises per student irrespective of coverage, so there is only one row per student.
+
+```{r setup}
+# Read the excel spreadsheet
+df <- read_excel("06 - CAS Predictive Modeling Case Competition- Dataset.xlsx")
+
+model_cov <- df %>%
+  mutate(has_claim = (claim_id != 0) & (amount > 0),
+         student_holdout = holdout) %>%
+    # First, determine consistent holdout flag per student
+  group_by(student_id) %>%
+  mutate(consistent_holdout = any(student_holdout)) %>%
+  ungroup() %>%
+  group_by(student_id, coverage) %>%
+  summarise(
+    # static student fields (should be identical within student_id)
+    name = first(name),
+    class = first(class),
+    study = first(study),
+    gpa = first(gpa),
+    greek = first(greek),
+    off_campus = first(off_campus),
+    distance_to_campus = first(distance_to_campus),
+    gender = first(gender),
+    sprinklered = first(sprinklered),
+    risk_tier = first(risk_tier),
+
+    # holdout: in principle it should be identical across all 4 rows and duplicates;
+    # this makes it robust if not identical (TRUE if any row says holdout)
+    holdout = first(consistent_holdout),
+
+    # targets at the student×coverage level
+    loss = sum(amount, na.rm = TRUE),
+    claim_count = sum(has_claim),
+    has_claim = as.integer(any(has_claim)),
+
+    # optional: retain how many raw rows collapsed (useful to audit max_n=3 issue)
+    n_raw_rows = n(),
+    .groups = "drop"
+  ) %>%
+  # ensure we don't have duplicates
+  distinct(student_id, coverage, .keep_all = TRUE)
+
+
+# student level summary
+model_student <- model_cov %>%
+  group_by(student_id) %>%
+  summarise(
+    name = first(name),
+    risk_tier = first(risk_tier),
+    holdout = any(holdout),
+    total_loss = sum(loss, na.rm = TRUE),
+    total_claims = sum(claim_count),
+    any_claim = as.integer(any(has_claim)),
+    .groups = "drop"
+  )
+```
+
+Re-checking the dataset to ensure that everything worked as intedended and each student has only 1 `studen_id`x`coverage` row and 4 rows per student.
+
+```{r}
+# A) Confirm uniqueness: should be 1 row per (student_id, coverage)
+model_cov %>% count(student_id, coverage) %>% summarise(max_n = max(n))
+
+# B) Confirm you have ~4 rows per student (coverage rows)
+model_cov %>% count(student_id) %>% summarise(min_rows = min(n), max_rows = max(n))
+```
+
+Here we are splitting the 99th percentile data so that we can have a set to train the model, then a set to validate whether the model is accurate.Variables `train`, and `valid` respectively.
+
+```{r}
+# 99th percentile threshold
+thr99 <- quantile(df$amount, 0.995, na.rm = TRUE)
+
+# Students in the top 1%
+top1_ids <- df %>% 
+  filter(amount > thr99) %>%
+  distinct(student_id) %>%
+  pull(student_id)
+```
+
+### Implementing a Generalized Linear Model
+
+The model is $E[Y|X] \text{ ~ } N(X \beta, \sigma^2)$ and $\mu_i = E[Y_i]$ for $g(\mu_i) = X\beta$
+
+Assumptions:
+
+1.  Random component: $Y_i$ is independent and from an exponential family distribution
+2.  Systematic component: The co-variates ($X_1, X_2, ...$) are combined to give a predictor $\eta$ so,\
+    $$\eta = X\beta$$
+3.  Link function: Relationship between random and systematic component given by $g(\cdot)$.\
+    $$E[Y] = \mu = g^{-1}(\eta) = g^{-1}(X \beta + \epsilon)$$The most common types of link functions are: Identity (Gaussian), Logit (Binomial), Log (Poisson), Inverse (Gamma), and Probit + more. For each the distribution is given:\
+    $$ 
+    \text{Inditity link: } g(\mu) = \mu \\
+    \text{Logit link: } g(\mu) = ln(\frac{\mu}{1 - \mu}) \\
+    \text{Log link: } g(\mu) = ln(\mu) \\
+    \text{Inverse link: } g(\mu) = \frac{1}{\mu} \\
+    \text{Probit link: } g(\mu) = \Phi^{-1}(\mu)
+    $$
+
+Exponential family of functions given as\
+$$f_i(y_i ; \theta_i, \phi) = \exp( \frac{y_i \theta_i - b(\theta_i)}{a_i(\phi)}-c(y_i, \phi) )$$
+
+Where $\theta_i$ is a parameter related to the mean, and $\phi$ is a scale parameter related to the variance.
+
+Generally, GLM's in insurance policy use Tweedie (single model): handles 0 loss and positive loss. Alternatively Two Part model: handles frequency (claim indicator + count) and the severity of the loss
+
+We will implement both to see which is more accurate. First implementing a Tweedie log link.\
+- Include risk_tier as a factor =\> different baseline per risk_tier - Include coverage as a factor =\> different baseline per coverage - Allow predictors to vary by coverage - Fit on training so holdout==FALSE
+
+Format the data for model.
+
+```{r}
+# 1) Prep variables (do this once)
+model_cov2 <- model_cov %>%
+  filter(!(student_id %in% top1_ids)) %>%
+  mutate(
+    risk_tier = factor(risk_tier),
+    coverage  = factor(coverage),
+    gender    = factor(gender),
+    off_campus= factor(off_campus),
+    greek     = factor(greek),
+    class     = factor(class),
+    study     = factor(study),
+    sprinklered = factor(sprinklered),
+    log_dist = log1p(distance_to_campus),
+  )
+
+#splitting into train and test data
+train <- model_cov2 %>% filter(!holdout)
+test  <- model_cov2 %>% filter(holdout)
+```
+
+Actually train the model. This make take some time.
+
+The model works by repeatedly fitting a Tweedie GLM for every given p value in our p-vector then comparing the log-likelihoods to choose the best p.
+
+\*ISSUE WHEN FIRST RUNNING MODEL\
+The p values were too high, we were using 1.1 to 1.9 however values after 1.544898 were unstable.\
+Divergence at higher p is likely because: - Very heavy tailed losses (distribution is extremely skewed) - Many exact 0s mixed with large positives - Higher-dimensional factor (matrix associated can be too large and values become skewed) - Rare categories (Certain combinations of factors produce almost 0s)
+
+```{r}
+# 2) Estimate Tweedie variance power p (data-driven)
+p_fit <- tweedie.profile(
+  loss ~ risk_tier + coverage +
+    coverage:(off_campus + log_dist + sprinklered) +
+    gender + greek + class + study,
+  data = train,
+  p.vec = seq(1.1, 1.55, by = 0.05)
+)
+p_hat <- p_fit$p.max
+```
+
+```{r}
+# 3) Fit Tweedie GLM (log link)
+tw_fit <- glm(
+  loss ~ risk_tier + coverage +
+    coverage:(off_campus + log_dist + sprinklered) +
+    gender + greek + class + study,
+  data = train,
+  family = tweedie(var.power = p_hat, link.power = 0)
+)
+
+# 4) Predict pure premium per student×coverage
+model_cov2$pure_cov <- predict(tw_fit, newdata = model_cov2, type = "response")
+```
+
+What this gives is `pure_cov` = E[`loss` \| `covariates`] as our model
+
+Checking now the calibration of our model.
+
+```{r}
+
+hold <- model_cov2 %>% filter(holdout)
+
+calibration <- c(
+  actual_mean = mean(hold$loss),
+  pred_mean   = mean(hold$pure_cov),
+  error_pct = abs(mean(holdout_data$loss) - mean(holdout_data$pure_cov)) / mean(holdout_data$loss) * 100
+)
+print(calibration)
+
+decile_results <- hold %>%
+  mutate(decile = dplyr::ntile(pure_cov, 10)) %>%
+  group_by(decile) %>%
+  summarise(actual = mean(loss), pred = mean(pure_cov), n = n(), .groups="drop")
+print(decile_results)
+```
+
+The results are as follows, an actual mean vs predicted mean are 4% off gotten by $|216.6096 - 208.2771|/208.2771 \approx 0.04$. The decile divides our model into 10 subgroups of 10% depending on risk. Notice that as the deciles go up, the actual mean and predicted mean also increase except for two small scenarios which are marginally off. The highest decile shows a large increase which is exactly what we want. However, notice that our model is slightly more aggressive when differentiating between high risk and low risk. This creates potential equity/acceptance issues.
+
+We tried the 99th percentile but this caused our error to increase to 7% and we were essentially excluding claimed amounts values greater than 9000.\
+We then tried the 99.5th percentile and got a better error of 2.7% but this time we were undercharging and exclude loss for greater than 20,000. However it is important to note that the 4th decile is always decreasing significantly from the previous value. So in this case it went from 64 to 28 for actual.
+
+Find the cap and cap for that given model.
+```{r}
+# The 99.5th quantile of prices to "Cap" rates at this value.
+cap_tbl <- model_cov2 %>%
+  filter(!holdout) %>%
+  group_by(coverage) %>%
+  summarise(cap = quantile(pure_cov, 0.995), .groups="drop")
+
+model_cov2 <- model_cov2 %>%
+  left_join(cap_tbl, by="coverage") %>%
+  mutate(pure_cov_cap = pmin(pure_cov, cap))
+```
+
+`pure_cov` is the models expected loss for that student and that coverage per unit exposure. So `pure_cov` = $E[loss_i | X_i]$\
+`cap` is the upper limit for that coverage category\
+`pure_cov_cap` is the minimum value between cap and pure_cov\
+`base_pure_cov` is the base rate for the average policy holder\
+`relativity_cov` is the multiplicative factor that compares a person to a tier.\
+
+### Constructing the Priceing
+
+Construct the pricing per tiers by using base tiers as per the information.
+
+Below we calculate the tier x coverage rate on only the training data.
+```{r}
+# Base tier rate per coverage
+base_by_tier_cov <- model_cov2 %>%
+  filter(!holdout) %>%
+  group_by(risk_tier, coverage) %>%
+  summarise(base_pure_cov = mean(pure_cov), .groups = "drop")
+
+model_cov2 <- model_cov2 %>%
+  left_join(base_by_tier_cov, by=c("risk_tier","coverage")) %>%
+  mutate(relativity_cov = pure_cov_cap / base_pure_cov)
+```
+
+### Charging the Premium now
+
+Fix values for us to charge the premium.
+```{r}
+fixed_expense <- 25      # per policy (not per coverage)
+var_exp_ratio <- 0.20    # variable expense ratio
+profit_ratio  <- 0.05    # underwriting profit / contingency ratio
+cap_q <- 0.995           # prediction cap percentile within coverage
+use_cap <- TRUE          # set FALSE to skip capping
+
+```
+
+`pure_total` is each students expected loss.\
+`base_pure_total` is the tier based pure premium for the average insured in that tier.
+
+Build policy-level totals first
+```{r}
+policy_tbl <- model_cov2 %>%
+  group_by(student_id, risk_tier) %>%
+  summarise(
+    holdout = first(holdout), # all rows have same holdout flag now
+    pure_total = sum(pure_cov_cap, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  distinct(student_id, .keep_all = TRUE) %>%
+  mutate(
+    premium_total = (pure_total + fixed_expense) / (1 - var_exp_ratio - profit_ratio)
+  )
+```
+
+Allocate policy premiums back to coverage proportionally
+```{r}
+
+priced_cov <- model_cov2 %>%
+  left_join(policy_tbl, by = c("student_id", "risk_tier")) %>%
+  mutate(holdout_check = holdout.x == holdout.y) %>%
+  group_by(student_id) %>%
+  mutate(
+    # allocation weight: share of pure premium
+    weight = pure_cov_cap / sum(pure_cov_cap),
+    premium_cov = premium_total * weight
+  ) %>%
+  ungroup() %>%
+  select(-holdout.y, -holdout_check) %>%
+  rename(holdout = holdout.x)
+```
+
+`premium_total`: the final premium charged per student
+`premium_cov`: charged premium per coverage that sums to premium_total per student
+
+### Produce the final deliverables
+
+```{r}
+final_policy_prices <- policy_tbl %>%
+  select(student_id, risk_tier, holdout, pure_total, premium_total) %>%
+  arrange(risk_tier, student_id)
+
+# coverage level premiums
+final_coverage_prices <- priced_cov %>%
+  select(
+    student_id, risk_tier, coverage, holdout,
+    pure_cov, pure_cov_cap, base_pure_cov,
+    relativity_cov, premium_cov
+  ) %>%
+  arrange(student_id, coverage)
+
+final_coverage_prices
+
+final_policy_prices
+```
+
+# ISSUE BIG ISSUE
+
+This means that for one student, that the difference between what they should be getting charged and what they are is $1400 which is a huge difference not just some noise. We must fix this!!
+
+```{r}
+check_sum <- final_coverage_prices %>%
+  group_by(student_id) %>%
+  summarise(sum_cov = sum(premium_cov), .groups = "drop") %>%
+  left_join(final_policy_prices, by = "student_id") %>%
+  summarise(max_abs_diff = max(abs(sum_cov - premium_total)))
+
+check_sum
+
+```

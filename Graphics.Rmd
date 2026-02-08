@@ -2,6 +2,208 @@
 
 
 ```{r}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# Themes for colouring the slides
+library(ggthemes)
+library(viridis)
+
+# Global plot theme (clean, slide-friendly)
+theme_set(
+  theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      #axis.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      legend.title = element_blank(),
+      legend.position = "top"
+    )
+)
+
+```
+
+```{r}
+set.seed(1)
+
+PRED_COV <- "pure_cov_cap"
+
+stopifnot(PRED_COV %in% names(model_cov2))
+
+# Consistent ordering for plots
+cov_order <- c("Personal Property", "Additional Living Expense", "Liability", "Guest Medical")
+
+
+df_cov <- model_cov2 %>%
+  mutate(
+    coverage = factor(as.character(coverage), levels = cov_order),
+    risk_tier = factor(risk_tier)
+  )
+
+# Policy-level table (sums the 4 coverages per student)
+df_pol <- df_cov %>%
+  group_by(student_id, risk_tier, holdout) %>%
+  summarise(
+    actual_total = sum(loss, na.rm = TRUE),
+    pred_total   = sum(.data[[PRED_COV]], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Use HOLDOUT for model performance slides
+hold_cov <- df_cov %>% filter(holdout)
+hold_pol <- df_pol %>% filter(holdout)
+```
+
+```{r}
+p1 <- df_cov %>%
+  filter(!holdout) %>%
+  group_by(coverage) %>%
+  summarise(mean_loss = mean(loss, na.rm = TRUE), .groups="drop") %>%
+  ggplot(aes(x = coverage, y = mean_loss, fill=coverage)) +
+  geom_col(width=0.75, alpha=0.9) +
+  scale_fill_viridis_d(option = "B", end = 0.2) +
+  labs(title = "Average Loss per Coverage on Training Dataset", x = NULL, y = "Mean Loss") +
+  theme(axis.text.x = element_text(angle = 20, vjust = 1, hjust = 1, size=10), legend.position = "none")
+
+#ggsave("slide_figs/avg_loss_by_coverage.png", p1, width = 8, height = 4.5, dpi = 300)
+p1
+```
+
+
+```{r}
+p2 <- df_cov %>%
+  filter(!holdout) %>%
+  group_by(coverage) %>%
+  summarise(freq = mean(loss > 0), .groups="drop") %>%
+  ggplot(aes(x = coverage, y = freq)) +
+  geom_col() +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(title = "Claim Frequency by Coverage (Training)", x = NULL, y = "P(Loss > 0)") +
+  theme_minimal(base_size = 12)
+
+ggsave("slide_figs/frequency_by_coverage.png", p2, width = 8, height = 4.5, dpi = 300)
+p2
+```
+
+
+```{r}
+tier_tbl <- hold_pol %>%
+  group_by(risk_tier) %>%
+  summarise(
+    actual = mean(actual_total),
+    pred   = mean(pred_total),
+    pct_err = (pred - actual) / actual,
+    n = n(),
+    .groups="drop"
+  )
+
+p3 <- tier_tbl %>%
+  ggplot(aes(x = risk_tier, y = pct_err)) +
+  geom_col() +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(title = "Tier Calibration (Holdout)", x = "Risk Tier", y = "Percent Error") +
+  theme_minimal(base_size = 12)
+
+#ggsave("slide_figs/tier_pct_error.png", p3, width = 7, height = 4.5, dpi = 300) # already ran this run again to save new slide
+
+tier_tbl
+p3
+```
+
+
+```{r}
+cov_cal <- hold_cov %>%
+  group_by(coverage) %>%
+  summarise(
+    actual = mean(loss),
+    pred   = mean(.data[[PRED_COV]]),
+    pct_err = (pred - actual) / actual,
+    n = n(),
+    .groups="drop"
+  )
+
+cov_cal
+p4 <- cov_cal %>%
+  ggplot(aes(x = coverage, y = pct_err)) +
+  geom_col() +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(title = "Coverage Calibration (Holdout)", x = NULL, y = "Percent Error") +
+  theme_minimal(base_size = 12)
+
+ggsave("slide_figs/coverage_pct_error.png", p4, width = 8, height = 4.5, dpi = 300)
+p4
+```
+
+
+```{r}
+decile_tbl <- hold_pol %>%
+  mutate(decile = ntile(pred_total, 10)) %>%
+  group_by(decile) %>%
+  summarise(
+    actual = mean(actual_total),
+    pred   = mean(pred_total),
+    n = n(),
+    .groups="drop"
+  )
+
+p5 <- decile_tbl %>%
+  tidyr::pivot_longer(cols = c(actual, pred), names_to = "series", values_to = "value") %>%
+  ggplot(aes(x = decile, y = value, group = series)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(labels = dollar) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(title = "Decile Lift (Holdout, Policy Total)", x = "Decile (by predicted premium)", y = "Average $", color = NULL) +
+  theme_minimal(base_size = 12)
+
+ggsave("slide_figs/decile_lift_policy.png", p5, width = 8, height = 4.5, dpi = 300)
+p5
+```
+
+```{r}
+p6 <- hold_pol %>%
+  ggplot(aes(x = pred_total, y = actual_total)) +
+  geom_point(alpha = 0.4) +
+  scale_x_continuous(labels = dollar) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Predicted vs Actual (Holdout, Policy Total)", x = "Predicted $", y = "Actual $") +
+  theme_minimal(base_size = 12)
+
+ggsave("slide_figs/pred_vs_actual_policy.png", p6, width = 7, height = 5, dpi = 300)
+p6
+```
+
+
+```{r}
+tier_cov_tbl <- hold_cov %>%
+  group_by(risk_tier, coverage) %>%
+  summarise(
+    actual = mean(loss),
+    pred   = mean(.data[[PRED_COV]]),
+    pct_err = (pred - actual) / actual,
+    .groups="drop"
+  )
+
+p7 <- tier_cov_tbl %>%
+  ggplot(aes(x = coverage, y = risk_tier, fill = pct_err)) +
+  geom_tile() +
+  scale_fill_gradient2(labels = percent_format(accuracy = 1)) +
+  labs(title = "Tier × Coverage Calibration (Holdout)", x = NULL, y = "Risk Tier", fill = "% Error") +
+  theme_minimal(base_size = 12)
+
+ggsave("slide_figs/tier_x_coverage_heatmap.png", p7, width = 8, height = 4.2, dpi = 300)
+p7
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
 
 
 ```

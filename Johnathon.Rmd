@@ -130,6 +130,7 @@ top1_ids <- df %>%
   filter(amount > thr99) %>%
   distinct(student_id) %>%
   pull(student_id)
+
 ```
 
 ### Implementing a Generalized Linear Model
@@ -165,6 +166,40 @@ Format the data for model.
 
 ```{r}
 # 1) Prep variables (do this once)
+model_cov2 <- model_cov %>%
+  filter(!(student_id %in% top1_ids)) %>%
+  mutate(
+    risk_tier = factor(risk_tier),
+    coverage  = factor(coverage),
+    gender    = factor(gender),
+    off_campus= factor(off_campus),
+    greek     = factor(greek),
+    class     = factor(class),
+    study     = factor(study),
+    sprinklered = factor(sprinklered),
+    log_dist = log1p(distance_to_campus),
+  )
+
+#splitting into train and test data
+train <- model_cov2 %>% filter(!holdout)
+test  <- model_cov2 %>% filter(holdout)
+```
+
+```{r}
+# 2) Estimate Tweedie variance power p (data-driven)
+p_fit <- tweedie.profile(
+  loss ~ risk_tier + coverage +
+    coverage:(off_campus + log_dist + sprinklered) +
+    gender + greek + class + study,
+  data = train,
+  p.vec = seq(1.1, 1.55, by = 0.05)
+)
+p_hat <- p_fit$p.max
+```
+
+Use the models.
+```{r}
+# 1) Prep variables (do this once)
 tw_fit_interactions <- glm(
   loss ~ 
     # Main effects
@@ -179,6 +214,31 @@ tw_fit_interactions <- glm(
   data = train,
   family = tweedie(var.power = p_hat, link.power = 0)
 )
+
+
+# 3) Fit Tweedie GLM (log link)
+tw_fit <- glm(
+  loss ~ risk_tier + coverage +
+    coverage:(off_campus + log_dist + sprinklered) +
+    gender + greek + class + study,
+  data = train,
+  family = tweedie(var.power = p_hat, link.power = 0)
+)
+```
+
+```{r}
+# The 99.5th quantile of prices to "Cap" rates at this value.
+cap_tbl <- model_cov2 %>%
+  filter(!holdout) %>%
+  group_by(coverage) %>%
+  summarise(cap = quantile(pure_cov, 0.995), .groups="drop")
+
+model_cov2 <- model_cov2 %>%
+  left_join(cap_tbl, by="coverage") %>%
+  mutate(pure_cov_cap = pmin(pure_cov, cap))
+```
+
+```{r}
 
 # Compare model summaries
 cat("\n=== MODEL COMPARISON ===\n")
@@ -208,7 +268,6 @@ base_by_tier_cov_interactions <- model_cov2 %>%
 model_cov2 <- model_cov2 %>%
   left_join(base_by_tier_cov_interactions, by = c("risk_tier", "coverage")) %>%
   mutate(relativity_cov_interactions = pure_cov_cap_interactions / base_pure_cov_interactions)
-
 # model_cov2 <- model_cov %>%
 #   filter(!(student_id %in% top1_ids)) %>%
 #   mutate(
@@ -223,9 +282,6 @@ model_cov2 <- model_cov2 %>%
 #     log_dist = log1p(distance_to_campus),
 #   )
 
-#splitting into train and test data
-train <- model_cov2 %>% filter(!holdout)
-test  <- model_cov2 %>% filter(holdout)
 ```
 
 Actually train the model. This make take some time.
@@ -236,31 +292,6 @@ The model works by repeatedly fitting a Tweedie GLM for every given p value in o
 The p values were too high, we were using 1.1 to 1.9 however values after 1.544898 were unstable.\
 Divergence at higher p is likely because: - Very heavy tailed losses (distribution is extremely skewed) - Many exact 0s mixed with large positives - Higher-dimensional factor (matrix associated can be too large and values become skewed) - Rare categories (Certain combinations of factors produce almost 0s)
 
-```{r}
-# 2) Estimate Tweedie variance power p (data-driven)
-p_fit <- tweedie.profile(
-  loss ~ risk_tier + coverage +
-    coverage:(off_campus + log_dist + sprinklered) +
-    gender + greek + class + study,
-  data = train,
-  p.vec = seq(1.1, 1.55, by = 0.05)
-)
-p_hat <- p_fit$p.max
-```
-
-```{r}
-# 3) Fit Tweedie GLM (log link)
-tw_fit <- glm(
-  loss ~ risk_tier + coverage +
-    coverage:(off_campus + log_dist + sprinklered) +
-    gender + greek + class + study,
-  data = train,
-  family = tweedie(var.power = p_hat, link.power = 0)
-)
-
-# 4) Predict pure premium per student×coverage
-model_cov2$pure_cov <- predict(tw_fit, newdata = model_cov2, type = "response")
-```
 
 What this gives is `pure_cov` = E[`loss` \| `covariates`] as our model
 
@@ -290,17 +321,7 @@ We tried the 99th percentile but this caused our error to increase to 7% and we 
 We then tried the 99.5th percentile and got a better error of 2.7% but this time we were undercharging and exclude loss for greater than 20,000. However it is important to note that the 4th decile is always decreasing significantly from the previous value. So in this case it went from 64 to 28 for actual.
 
 Find the cap and cap for that given model.
-```{r}
-# The 99.5th quantile of prices to "Cap" rates at this value.
-cap_tbl <- model_cov2 %>%
-  filter(!holdout) %>%
-  group_by(coverage) %>%
-  summarise(cap = quantile(pure_cov, 0.995), .groups="drop")
 
-model_cov2 <- model_cov2 %>%
-  left_join(cap_tbl, by="coverage") %>%
-  mutate(pure_cov_cap = pmin(pure_cov, cap))
-```
 
 `pure_cov` is the models expected loss for that student and that coverage per unit exposure. So `pure_cov` = $E[loss_i | X_i]$\
 `cap` is the upper limit for that coverage category\
@@ -411,6 +432,7 @@ check_sum <- final_coverage_prices %>%
 check_sum
 
 ```
+
 ```{r}
 # ============================================================================
 # COMPREHENSIVE MODEL ERROR ANALYSIS

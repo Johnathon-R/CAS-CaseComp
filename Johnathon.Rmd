@@ -165,6 +165,7 @@ We will implement both to see which is more accurate. First implementing a Tweed
 Format the data for model.
 
 ```{r}
+<<<<<<< HEAD
 # 1) Prep variables (do this once)
 model_cov2 <- model_cov %>%
   filter(!(student_id %in% top1_ids)) %>%
@@ -254,10 +255,24 @@ model_cov2$pure_cov_interactions <- predict(tw_fit_interactions,
 # Re-calculate capped values with new predictions
 model_cov2 <- model_cov2 %>%
   left_join(cap_tbl, by = "coverage") %>%
+=======
+
+model_cov2 <- model_cov %>%
+  filter(!(student_id %in% top1_ids)) %>%
+>>>>>>> bb79384cdfa28e17eb0858d08a9deb0d3f9f9b08
   mutate(
-    pure_cov_cap_interactions = pmin(pure_cov_interactions, cap)
+    risk_tier = factor(risk_tier),
+    coverage  = factor(coverage),
+    gender    = factor(gender),
+    off_campus= factor(off_campus),
+    greek     = factor(greek),
+    class     = factor(class),
+    study     = factor(study),
+    sprinklered = factor(sprinklered),
+    log_dist = log1p(distance_to_campus),
   )
 
+<<<<<<< HEAD
 # Update base rates and relativities
 base_by_tier_cov_interactions <- model_cov2 %>%
   filter(!holdout) %>%
@@ -282,6 +297,11 @@ model_cov2 <- model_cov2 %>%
 #     log_dist = log1p(distance_to_campus),
 #   )
 
+=======
+#splitting into train and test data
+train <- model_cov2 %>% filter(!holdout)
+test  <- model_cov2 %>% filter(holdout)
+>>>>>>> bb79384cdfa28e17eb0858d08a9deb0d3f9f9b08
 ```
 
 Actually train the model. This make take some time.

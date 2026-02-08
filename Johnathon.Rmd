@@ -164,64 +164,20 @@ We will implement both to see which is more accurate. First implementing a Tweed
 Format the data for model.
 
 ```{r}
-# 1) Prep variables (do this once)
-tw_fit_interactions <- glm(
-  loss ~ 
-    # Main effects
-    risk_tier + coverage + gender + greek + class + study +
-    
-    # Tier-specific effects for key risk factors
-    risk_tier:(off_campus + log_dist + sprinklered) +
-    
-    # Coverage-specific effects (as before)
-    coverage:(off_campus + log_dist + sprinklered),
-  
-  data = train,
-  family = tweedie(var.power = p_hat, link.power = 0)
-)
 
-# Compare model summaries
-cat("\n=== MODEL COMPARISON ===\n")
-cat("Original model AIC:", AIC(tw_fit), "\n")
-cat("Interaction model AIC:", AIC(tw_fit_interactions), "\n")
-cat("Improvement:", AIC(tw_fit) - AIC(tw_fit_interactions), "\n")
-
-# Predict with new model
-model_cov2$pure_cov_interactions <- predict(tw_fit_interactions, 
-                                             newdata = model_cov2, 
-                                             type = "response")
-
-# Re-calculate capped values with new predictions
-model_cov2 <- model_cov2 %>%
-  left_join(cap_tbl, by = "coverage") %>%
+model_cov2 <- model_cov %>%
+  filter(!(student_id %in% top1_ids)) %>%
   mutate(
-    pure_cov_cap_interactions = pmin(pure_cov_interactions, cap)
+    risk_tier = factor(risk_tier),
+    coverage  = factor(coverage),
+    gender    = factor(gender),
+    off_campus= factor(off_campus),
+    greek     = factor(greek),
+    class     = factor(class),
+    study     = factor(study),
+    sprinklered = factor(sprinklered),
+    log_dist = log1p(distance_to_campus),
   )
-
-# Update base rates and relativities
-base_by_tier_cov_interactions <- model_cov2 %>%
-  filter(!holdout) %>%
-  group_by(risk_tier, coverage) %>%
-  summarise(base_pure_cov_interactions = mean(pure_cov_interactions), 
-            .groups = "drop")
-
-model_cov2 <- model_cov2 %>%
-  left_join(base_by_tier_cov_interactions, by = c("risk_tier", "coverage")) %>%
-  mutate(relativity_cov_interactions = pure_cov_cap_interactions / base_pure_cov_interactions)
-
-# model_cov2 <- model_cov %>%
-#   filter(!(student_id %in% top1_ids)) %>%
-#   mutate(
-#     risk_tier = factor(risk_tier),
-#     coverage  = factor(coverage),
-#     gender    = factor(gender),
-#     off_campus= factor(off_campus),
-#     greek     = factor(greek),
-#     class     = factor(class),
-#     study     = factor(study),
-#     sprinklered = factor(sprinklered),
-#     log_dist = log1p(distance_to_campus),
-#   )
 
 #splitting into train and test data
 train <- model_cov2 %>% filter(!holdout)
